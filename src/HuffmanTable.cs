@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// 霍夫曼表实现，用于JPEG解码

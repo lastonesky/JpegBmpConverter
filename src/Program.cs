@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// 图像转换器主程序

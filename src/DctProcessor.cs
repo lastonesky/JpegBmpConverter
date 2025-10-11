@@ -1,6 +1,6 @@
 using System;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// DCT处理器，实现JPEG解码的核心算法

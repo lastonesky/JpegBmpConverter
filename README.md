@@ -1,4 +1,6 @@
-# JpegBmp Codec
+# JpegBmpConverter
+
+[English README](README.en.md)
 
 > ⚠️ 重要说明：本项目完全由 AI 生成  
 > 本项目的代码与文档由 AI 自动生成，供学习与研究使用。
@@ -20,20 +22,19 @@
 ## 项目结构
 
 ```
-JpegBmpCodec/
+JpegBmpConverter/
 ├── src/
 │   ├── Program.cs                 # 主程序入口与命令行解析
-│   ├── JpegDecoder.cs             # JPEG 解码器核心（解析/反量化/IDCT/颜色转换）
 │   ├── JpegEncoder.cs             # JPEG 编码器核心（DCT/量化/ZigZag/霍夫曼编码）
 │   ├── HuffmanTable.cs            # 霍夫曼表构建与码字信息
 │   ├── HuffmanDecoder.cs          # 霍夫曼位流解码器
 │   ├── DctProcessor.cs            # DCT/IDCT 与颜色空间相关处理
 │   ├── BmpReader.cs               # BMP 文件读取（用于 BMP→JPEG）
 │   ├── BmpWriter.cs               # BMP 文件写入（用于 JPEG→BMP）
-│   ├── LibjpegTurboStyleDecoder.cs# 另一解码风格（学习/参考用途）
 │   ├── PillowStyleJpegDecoder.cs  # Pillow 风格解码器（学习/参考用途）
 │   ├── SilentConsole.cs           # 静默/标准输出封装
-│   └── JpegToBmpConverter.csproj  # 项目文件
+│   ├── BmpToJpegProgram.cs        # BMP→JPEG 编码示例入口
+│   └── JpegBmpConverter.csproj    # 项目文件
 ├── README.md
 ├── README.en.md
 └── .gitignore
@@ -69,13 +70,13 @@ dotnet build -c Release
 ### 运行
 ```bash
 # 显示帮助（无参数时打印用法）
-dotnet run --project src/JpegToBmpConverter.csproj --
+dotnet run --project src/JpegBmpConverter.csproj --
 
 # JPEG → BMP
-dotnet run --project src/JpegToBmpConverter.csproj -- input.jpg output.bmp
+dotnet run --project src/JpegBmpConverter.csproj -- input.jpg output.bmp
 
 # BMP → JPEG（可选质量，默认 75）
-dotnet run --project src/JpegToBmpConverter.csproj -- input.bmp output.jpg 75
+dotnet run --project src/JpegBmpConverter.csproj -- input.bmp output.jpg 75
 ```
 
 ## 使用方法
@@ -83,28 +84,28 @@ dotnet run --project src/JpegToBmpConverter.csproj -- input.bmp output.jpg 75
 ### 命令行语法
 ```
 # JPEG → BMP
-JpegBmpCodec.exe <输入JPEG文件> <输出BMP文件>
+JpegBmpConverter.exe <输入JPEG文件> <输出BMP文件>
 
 # BMP → JPEG（可选质量）
-JpegBmpCodec.exe <输入BMP文件> <输出JPEG文件> [质量]
+JpegBmpConverter.exe <输入BMP文件> <输出JPEG文件> [质量]
 ```
 
 ### 示例（Windows/PowerShell）
 ```powershell
 # 单文件转换
-dotnet run --project src/JpegToBmpConverter.csproj -- photo.jpg photo.bmp
-dotnet run --project src/JpegToBmpConverter.csproj -- sample.bmp sample.jpg 80
+dotnet run --project src/JpegBmpConverter.csproj -- photo.jpg photo.bmp
+dotnet run --project src/JpegBmpConverter.csproj -- sample.bmp sample.jpg 80
 
 # 批量 JPEG → BMP 转换
 Get-ChildItem -Filter *.jpg | ForEach-Object {
   $dst = [System.IO.Path]::ChangeExtension($_.FullName, 'bmp')
-  dotnet run --project src/JpegToBmpConverter.csproj -- $_.FullName $dst
+  dotnet run --project src/JpegBmpConverter.csproj -- $_.FullName $dst
 }
 
 # 批量 BMP → JPEG 转换（质量 75）
 Get-ChildItem -Filter *.bmp | ForEach-Object {
   $dst = [System.IO.Path]::ChangeExtension($_.FullName, 'jpg')
-  dotnet run --project src/JpegToBmpConverter.csproj -- $_.FullName $dst 75
+  dotnet run --project src/JpegBmpConverter.csproj -- $_.FullName $dst 75
 }
 ```
 

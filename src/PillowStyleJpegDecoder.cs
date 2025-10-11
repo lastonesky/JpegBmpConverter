@@ -1,9 +1,9 @@
 using System;
 using System.IO;
 using System.Collections.Generic;
-using Console = JpegToBmpConverter.SilentConsole;
+using Console = JpegBmpConverter.SilentConsole;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// 基于libjpeg-turbo源码实现的JPEG解码器 - Pillow风格接口

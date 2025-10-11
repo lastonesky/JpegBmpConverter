@@ -1,6 +1,6 @@
 using System;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     // 静默控制台：用于屏蔽解码过程中的日志输出
     public static class SilentConsole

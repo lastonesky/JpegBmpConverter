@@ -1,6 +1,6 @@
 using System;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// 真正的霍夫曼解码器实现

@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// BMP文件写入器

@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace JpegToBmpConverter
+namespace JpegBmpConverter
 {
     /// <summary>
     /// JPEG编码器，基于Pillow库JpegEncode.c实现
