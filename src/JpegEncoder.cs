@@ -429,28 +429,58 @@ namespace JpegBmpConverter
             }
         }
 
+        private static readonly double[,] CosTable = PrecomputeCosTable();
+        private static readonly double[] C = Enumerable.Range(0, 8)
+            .Select(i => i == 0 ? 1.0 / Math.Sqrt(2.0) : 1.0)
+            .ToArray();
+
+        private static double[,] PrecomputeCosTable()
+        {
+            double[,] table = new double[8, 8];
+            for (int i = 0; i < 8; i++)
+            {
+                for (int j = 0; j < 8; j++)
+                {
+                    table[i, j] = Math.Cos((2 * j + 1) * i * Math.PI / 16.0);
+                }
+            }
+            return table;
+        }
+
         private static double[,] ForwardDct(int[,] samples)
         {
+            double[,] temp = new double[8, 8];
             double[,] coeffs = new double[8, 8];
+
+            // --- 行变换 ---
+            for (int y = 0; y < 8; y++)
+            {
+                for (int u = 0; u < 8; u++)
+                {
+                    double sum = 0.0;
+                    for (int x = 0; x < 8; x++)
+                    {
+                        sum += samples[y, x] * CosTable[u, x];
+                    }
+                    temp[y, u] = sum;
+                }
+            }
+
+            // --- 列变换 ---
             for (int u = 0; u < 8; u++)
             {
                 for (int v = 0; v < 8; v++)
                 {
-                    double cu = (u == 0) ? 1.0 / Math.Sqrt(2.0) : 1.0;
-                    double cv = (v == 0) ? 1.0 / Math.Sqrt(2.0) : 1.0;
                     double sum = 0.0;
-                    for (int x = 0; x < 8; x++)
+                    for (int y = 0; y < 8; y++)
                     {
-                        for (int y = 0; y < 8; y++)
-                        {
-                            sum += samples[y, x]
-                                * Math.Cos((2 * x + 1) * u * Math.PI / 16.0)
-                                * Math.Cos((2 * y + 1) * v * Math.PI / 16.0);
-                        }
+                        sum += temp[y, u] * CosTable[v, y];
                     }
-                    coeffs[u, v] = 0.25 * cu * cv * sum;
+                    // ✅ 正确的缩放系数只在此处乘上
+                    coeffs[u, v] = 0.25 * C[u] * C[v] * sum;
                 }
             }
+
             return coeffs;
         }
 
