@@ -296,6 +296,33 @@ namespace JpegBmpConverter
                 QC[i / 8, i % 8] = ChrominanceQuantTable[i];
             }
 
+            // --- 👇 AAN DCT 缩放修正（加在这里） ---
+            double[] AAN_SCALE = new double[8]
+            {
+                1.0,
+                1.387039845,
+                1.306562965,
+                1.175875602,
+                1.0,
+                0.785694958,
+                0.541196100,
+                0.275899379
+            };
+
+            for (int u = 0; u < 8; u++)
+            {
+                for (int v = 0; v < 8; v++)
+                {
+                    double scale = AAN_SCALE[u] * AAN_SCALE[v];
+                    QY[u, v] = (int)Math.Round(QY[u, v] * scale);
+                    QC[u, v] = (int)Math.Round(QC[u, v] * scale);
+                    // 防止过小变成0
+                    if (QY[u, v] == 0) QY[u, v] = 1;
+                    if (QC[u, v] == 0) QC[u, v] = 1;
+                }
+            }
+            
+            
             // 构建霍夫曼码映射
             LuminanceDCHuffman.BuildCodes();
             LuminanceACHuffman.BuildCodes();
@@ -361,7 +388,7 @@ namespace JpegBmpConverter
             }
 
             // 正向DCT
-            double[,] dct = ForwardDct(samples);
+            double[,] dct = ForwardDctAAN(samples);
 
             // 量化并按Zigzag顺序重排
             int[] flat = new int[64];
@@ -483,6 +510,128 @@ namespace JpegBmpConverter
 
             return coeffs;
         }
+        // AAN 8x8 快速DCT实现（与JPEG标准一致）
+        // 输入: int[8,8] 样本（通常为 -128 ~ +127）
+        // 输出: double[8,8] DCT系数（未量化）
+
+        private static double[,] ForwardDctAAN(int[,] data)
+        {
+            double[,] tmp = new double[8, 8];
+            double[,] outp = new double[8, 8];
+
+            // 常量（AAN系数）
+            const double C1 = 0.98078528;
+            const double C2 = 0.92387953;
+            const double C3 = 0.83146961;
+            const double C5 = 0.55557023;
+            const double C6 = 0.38268343;
+            const double C7 = 0.19509032;
+
+            // --- 行DCT ---
+            for (int y = 0; y < 8; y++)
+            {
+                double d0 = data[y, 0];
+                double d1 = data[y, 1];
+                double d2 = data[y, 2];
+                double d3 = data[y, 3];
+                double d4 = data[y, 4];
+                double d5 = data[y, 5];
+                double d6 = data[y, 6];
+                double d7 = data[y, 7];
+
+                double tmp0 = d0 + d7;
+                double tmp7 = d0 - d7;
+                double tmp1 = d1 + d6;
+                double tmp6 = d1 - d6;
+                double tmp2 = d2 + d5;
+                double tmp5 = d2 - d5;
+                double tmp3 = d3 + d4;
+                double tmp4 = d3 - d4;
+
+                double tmp10 = tmp0 + tmp3;
+                double tmp13 = tmp0 - tmp3;
+                double tmp11 = tmp1 + tmp2;
+                double tmp12 = tmp1 - tmp2;
+
+                tmp[0, y] = tmp10 + tmp11;
+                tmp[4, y] = tmp10 - tmp11;
+
+                double z1 = (tmp12 + tmp13) * 0.70710678;
+                tmp[2, y] = tmp13 + z1;
+                tmp[6, y] = tmp13 - z1;
+
+                tmp10 = tmp4 + tmp5;
+                tmp11 = tmp5 + tmp6;
+                tmp12 = tmp6 + tmp7;
+
+                double z5 = (tmp10 - tmp12) * 0.38268343;
+                double z2 = 0.54119610 * tmp10 + z5;
+                double z4 = 1.30656296 * tmp12 + z5;
+                double z3 = tmp11 * 0.70710678;
+
+                double z11 = tmp7 + z3;
+                double z13 = tmp7 - z3;
+
+                tmp[5, y] = z13 + z2;
+                tmp[3, y] = z13 - z2;
+                tmp[1, y] = z11 + z4;
+                tmp[7, y] = z11 - z4;
+            }
+
+            // --- 列DCT ---
+            for (int x = 0; x < 8; x++)
+            {
+                double d0 = tmp[x, 0];
+                double d1 = tmp[x, 1];
+                double d2 = tmp[x, 2];
+                double d3 = tmp[x, 3];
+                double d4 = tmp[x, 4];
+                double d5 = tmp[x, 5];
+                double d6 = tmp[x, 6];
+                double d7 = tmp[x, 7];
+
+                double tmp0 = d0 + d7;
+                double tmp7 = d0 - d7;
+                double tmp1 = d1 + d6;
+                double tmp6 = d1 - d6;
+                double tmp2 = d2 + d5;
+                double tmp5 = d2 - d5;
+                double tmp3 = d3 + d4;
+                double tmp4 = d3 - d4;
+
+                double tmp10 = tmp0 + tmp3;
+                double tmp13 = tmp0 - tmp3;
+                double tmp11 = tmp1 + tmp2;
+                double tmp12 = tmp1 - tmp2;
+
+                outp[x, 0] = (tmp10 + tmp11) * 0.125;
+                outp[x, 4] = (tmp10 - tmp11) * 0.125;
+
+                double z1 = (tmp12 + tmp13) * 0.70710678;
+                outp[x, 2] = (tmp13 + z1) * 0.125;
+                outp[x, 6] = (tmp13 - z1) * 0.125;
+
+                tmp10 = tmp4 + tmp5;
+                tmp11 = tmp5 + tmp6;
+                tmp12 = tmp6 + tmp7;
+
+                double z5 = (tmp10 - tmp12) * 0.38268343;
+                double z2 = 0.54119610 * tmp10 + z5;
+                double z4 = 1.30656296 * tmp12 + z5;
+                double z3 = tmp11 * 0.70710678;
+
+                double z11 = tmp7 + z3;
+                double z13 = tmp7 - z3;
+
+                outp[x, 5] = (z13 + z2) * 0.125;
+                outp[x, 3] = (z13 - z2) * 0.125;
+                outp[x, 1] = (z11 + z4) * 0.125;
+                outp[x, 7] = (z11 - z4) * 0.125;
+            }
+
+            return outp;
+        }
+
 
         private static int MagnitudeSize(int v)
         {
