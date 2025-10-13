@@ -15,6 +15,7 @@ namespace JpegBmpConverter
         private const byte JPEG_APP0 = 0xE0; // Application segment 0 (JFIF)
         private const byte JPEG_DQT = 0xDB;  // Define Quantization Table
         private const byte JPEG_SOF0 = 0xC0; // Start of Frame (baseline)
+        private const byte JPEG_SOF2 = 0xC2; // Start of Frame (progressive)
         private const byte JPEG_DHT = 0xC4;  // Define Huffman Table
         private const byte JPEG_SOS = 0xDA;  // Start of Scan
         private const byte JPEG_COM = 0xFE;  // Comment
@@ -139,7 +140,11 @@ namespace JpegBmpConverter
             WriteHuffmanTables(components);
             
             // 扫描头（SOS）
-            WriteScanHeader(components);
+            // 渐进模式下由编码流程控制写入多次扫描头
+            if (!Progressive)
+            {
+                WriteScanHeader(components);
+            }
         }
         
         /// <summary>
@@ -196,7 +201,8 @@ namespace JpegBmpConverter
         /// </summary>
         private void WriteFrameHeader(int width, int height, int components)
         {
-            WriteMarker(0xFF, JPEG_SOF0);
+            // Progressive 使用 SOF2，其它使用 SOF0
+            WriteMarker(0xFF, Progressive ? JPEG_SOF2 : JPEG_SOF0);
             bitWriter!.WriteUInt16((ushort)(8 + components * 3)); // 段长度
             bitWriter.WriteByte(8); // 精度
             bitWriter.WriteUInt16((ushort)height);
@@ -278,6 +284,29 @@ namespace JpegBmpConverter
             bitWriter.WriteByte(63); // 谱选择结束
             bitWriter.WriteByte(0); // 逐次逼近
         }
+
+        /// <summary>
+        /// 写入扫描头（可参数化渐进扫描的谱选择与逼近）
+        /// </summary>
+        private void WriteScanHeader(int components, byte ss, byte se, byte ah, byte al,
+                                     Func<int, byte> dcSelector, Func<int, byte> acSelector)
+        {
+            WriteMarker(0xFF, JPEG_SOS);
+            bitWriter!.WriteUInt16((ushort)(6 + components * 2)); // 段长度
+            bitWriter.WriteByte((byte)components);
+
+            for (int i = 0; i < components; i++)
+            {
+                bitWriter.WriteByte((byte)(i + 1)); // 分量ID
+                byte dcSel = dcSelector(i);
+                byte acSel = acSelector(i);
+                bitWriter.WriteByte((byte)((dcSel << 4) | (acSel & 0x0F)));
+            }
+
+            bitWriter.WriteByte(ss); // 谱选择开始
+            bitWriter.WriteByte(se); // 谱选择结束
+            bitWriter.WriteByte((byte)((ah << 4) | (al & 0x0F))); // 逐次逼近（高/低位）
+        }
         
         /// <summary>
         /// 编码图像数据
@@ -353,21 +382,181 @@ namespace JpegBmpConverter
             int blocksX = (width + 7) / 8;
             int blocksY = (height + 7) / 8;
 
-            int prevDC_Y = 0, prevDC_Cb = 0, prevDC_Cr = 0;
-
-            for (int by = 0; by < blocksY; by++)
+            if (!Progressive)
             {
-                for (int bx = 0; bx < blocksX; bx++)
+                int prevDC_Y = 0, prevDC_Cb = 0, prevDC_Cr = 0;
+                for (int by = 0; by < blocksY; by++)
                 {
-                    // 亮度块
-                    EncodeSingleBlock(Y, width, height, bx, by, QY, LuminanceDCHuffman, LuminanceACHuffman, ref prevDC_Y);
-                    if (!isGrayscale)
+                    for (int bx = 0; bx < blocksX; bx++)
                     {
-                        // 色度块（与亮度同采样）
-                        EncodeSingleBlock(Cb, width, height, bx, by, QC, ChrominanceDCHuffman, ChrominanceACHuffman, ref prevDC_Cb);
-                        EncodeSingleBlock(Cr, width, height, bx, by, QC, ChrominanceDCHuffman, ChrominanceACHuffman, ref prevDC_Cr);
+                        // 亮度块
+                        EncodeSingleBlock(Y, width, height, bx, by, QY, LuminanceDCHuffman, LuminanceACHuffman, ref prevDC_Y);
+                        if (!isGrayscale)
+                        {
+                            // 色度块（与亮度同采样）
+                            EncodeSingleBlock(Cb, width, height, bx, by, QC, ChrominanceDCHuffman, ChrominanceACHuffman, ref prevDC_Cb);
+                            EncodeSingleBlock(Cr, width, height, bx, by, QC, ChrominanceDCHuffman, ChrominanceACHuffman, ref prevDC_Cr);
+                        }
                     }
                 }
+            }
+            else
+            {
+                // --- 渐进JPEG（最小实现）：两次扫描 ---
+                // 扫描1：DC-only（Ss=0, Se=0, Ah=0, Al=0）
+                WriteScanHeader(
+                    isGrayscale ? 1 : 3,
+                    ss: 0,
+                    se: 0,
+                    ah: 0,
+                    al: 0,
+                    dcSelector: i => (byte)(i == 0 ? 0 : 1),
+                    acSelector: i => 0
+                );
+
+                int prevDC_Y = 0, prevDC_Cb = 0, prevDC_Cr = 0;
+                for (int by = 0; by < blocksY; by++)
+                {
+                    for (int bx = 0; bx < blocksX; bx++)
+                    {
+                        // 亮度块 DC
+                        int[] zzY = QuantizeAndZigZag(Y, width, height, bx, by, QY);
+                        EncodeDCOnly(zzY[0], LuminanceDCHuffman, ref prevDC_Y);
+
+                        if (!isGrayscale)
+                        {
+                            // 色度块 DC
+                            int[] zzCb = QuantizeAndZigZag(Cb, width, height, bx, by, QC);
+                            EncodeDCOnly(zzCb[0], ChrominanceDCHuffman, ref prevDC_Cb);
+
+                            int[] zzCr = QuantizeAndZigZag(Cr, width, height, bx, by, QC);
+                            EncodeDCOnly(zzCr[0], ChrominanceDCHuffman, ref prevDC_Cr);
+                        }
+                    }
+                }
+                bitWriter!.Flush();
+
+                // 扫描2：AC-only（Ss=1, Se=63, Ah=0, Al=0）
+                WriteScanHeader(
+                    isGrayscale ? 1 : 3,
+                    ss: 1,
+                    se: 63,
+                    ah: 0,
+                    al: 0,
+                    dcSelector: i => (byte)(i == 0 ? 0 : 1),
+                    acSelector: i => (byte)(i == 0 ? 0 : 1)
+                );
+
+                for (int by = 0; by < blocksY; by++)
+                {
+                    for (int bx = 0; bx < blocksX; bx++)
+                    {
+                        // 亮度块 AC
+                        int[] zzY = QuantizeAndZigZag(Y, width, height, bx, by, QY);
+                        EncodeACOnly(zzY, LuminanceACHuffman);
+
+                        if (!isGrayscale)
+                        {
+                            // 色度块 AC
+                            int[] zzCb = QuantizeAndZigZag(Cb, width, height, bx, by, QC);
+                            EncodeACOnly(zzCb, ChrominanceACHuffman);
+
+                            int[] zzCr = QuantizeAndZigZag(Cr, width, height, bx, by, QC);
+                            EncodeACOnly(zzCr, ChrominanceACHuffman);
+                        }
+                    }
+                }
+                bitWriter!.Flush();
+            }
+        }
+
+        // 量化并ZigZag重排，返回64系数数组
+        private int[] QuantizeAndZigZag(byte[] plane, int width, int height, int bx, int by, int[,] quant)
+        {
+            // 提取8x8采样块
+            int[,] samples = new int[8, 8];
+            for (int y = 0; y < 8; y++)
+            {
+                int py = Math.Min(by * 8 + y, height - 1);
+                for (int x = 0; x < 8; x++)
+                {
+                    int px = Math.Min(bx * 8 + x, width - 1);
+                    int v = plane[py * width + px];
+                    samples[y, x] = v - 128; // 居中
+                }
+            }
+
+            // 正向DCT
+            double[,] dct = ForwardDctAAN(samples);
+
+            // 量化并按Zigzag顺序重排
+            int[] flat = new int[64];
+            for (int u = 0; u < 8; u++)
+            {
+                for (int v = 0; v < 8; v++)
+                {
+                    int q = (int)Math.Round(dct[u, v] / quant[v, u]);
+                    flat[v * 8 + u] = q;
+                }
+            }
+            int[] zz = new int[64];
+            for (int i = 0; i < 64; i++)
+            {
+                int naturalIdx = ZigZagOrder[i];
+                zz[i] = flat[naturalIdx];
+            }
+            return zz;
+        }
+
+        // 仅编码DC（渐进的首个扫描）
+        private void EncodeDCOnly(int dcCoeff, HuffmanEncoder dcTbl, ref int prevDC)
+        {
+            int diff = dcCoeff - prevDC;
+            prevDC = dcCoeff;
+            int size = MagnitudeSize(diff);
+            dcTbl.EncodeSymbol(bitWriter!, (byte)size);
+            if (size > 0)
+            {
+                uint bits = EncodeMagnitudeBits(diff, size);
+                bitWriter!.WriteBits(bits, size);
+            }
+        }
+
+        // 仅编码AC（渐进的第二个扫描）
+        private void EncodeACOnly(int[] zz, HuffmanEncoder acTbl)
+        {
+            int run = 0;
+            for (int i = 1; i <= 63; i++)
+            {
+                int val = zz[i];
+                if (val == 0)
+                {
+                    run++;
+                    if (run == 16)
+                    {
+                        acTbl.EncodeSymbol(bitWriter!, 0xF0);
+                        run = 0;
+                    }
+                    continue;
+                }
+
+                while (run >= 16)
+                {
+                    acTbl.EncodeSymbol(bitWriter!, 0xF0);
+                    run -= 16;
+                }
+
+                int sz = MagnitudeSize(val);
+                byte symbol = (byte)((run << 4) | sz);
+                acTbl.EncodeSymbol(bitWriter!, symbol);
+                uint abits = EncodeMagnitudeBits(val, sz);
+                bitWriter!.WriteBits(abits, sz);
+                run = 0;
+            }
+
+            if (run > 0)
+            {
+                acTbl.EncodeSymbol(bitWriter!, 0x00); // EOB
             }
         }
 

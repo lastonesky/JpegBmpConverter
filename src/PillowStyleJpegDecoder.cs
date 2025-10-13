@@ -182,6 +182,11 @@ namespace JpegBmpConverter
         private bool bitstreamEnded = false;   // 位流是否已结束（遇到标记或数据耗尽）
         private int dataIndex = 0;             // 当前数据位置
         private int scanDataStart = 0;         // 扫描数据开始位置
+        private bool progressiveMode = false;  // 是否为渐进JPEG（基于SOS参数判定）
+        private short[][] progCoeffBuffers0;   // 分量0（通常Y）的系数缓冲（每块64系数）
+        private short[][] progCoeffBuffers1;   // 分量1（通常Cb）的系数缓冲
+        private short[][] progCoeffBuffers2;   // 分量2（通常Cr）的系数缓冲
+        private int[] progBlockCursor = new int[4]; // 渐进扫描时每分量的块游标
         
         // 组件信息扩展
         public class ComponentInfoExtended
@@ -192,6 +197,11 @@ namespace JpegBmpConverter
             public int quantTableIndex;
             public int dc_tbl_no;
             public int ac_tbl_no;
+            // Progressive scan parameters
+            public int Ss; // Spectral selection start
+            public int Se; // Spectral selection end
+            public int Ah; // Successive approximation high
+            public int Al; // Successive approximation low
         }
         
         private ComponentInfoExtended[] componentInfoExt = new ComponentInfoExtended[4];
@@ -223,6 +233,45 @@ namespace JpegBmpConverter
         {
             cinfo = new DecompressInfo();
             InitializeDecompressInfo();
+        }
+
+        // 计算每分量在整幅图中的块总数（基于采样因子和最大采样）
+        private int ComputeTotalBlocksForComponent(int compIndex)
+        {
+            var ext = componentInfoExt[compIndex];
+            if (ext == null) return 0;
+            int hCount = Math.Max(1, ext.hSampFactor);
+            int vCount = Math.Max(1, ext.vSampFactor);
+            int mcusPerRow = (Width + (8 * maxHSampFactor) - 1) / (8 * maxHSampFactor);
+            int imcuRows = (Height + (8 * maxVSampFactor) - 1) / (8 * maxVSampFactor);
+            return mcusPerRow * imcuRows * hCount * vCount;
+        }
+
+        // 为渐进JPEG分配系数缓冲区
+        private void AllocateProgressiveBuffersIfNeeded()
+        {
+            if (!progressiveMode) return;
+            // 分配并重置游标
+            for (int i = 0; i < progBlockCursor.Length; i++) progBlockCursor[i] = 0;
+
+            if (Components >= 1 && progCoeffBuffers0 == null)
+            {
+                int totalBlocks = ComputeTotalBlocksForComponent(0);
+                progCoeffBuffers0 = new short[totalBlocks][];
+                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers0[i] = new short[64];
+            }
+            if (Components >= 2 && progCoeffBuffers1 == null)
+            {
+                int totalBlocks = ComputeTotalBlocksForComponent(1);
+                progCoeffBuffers1 = new short[totalBlocks][];
+                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers1[i] = new short[64];
+            }
+            if (Components >= 3 && progCoeffBuffers2 == null)
+            {
+                int totalBlocks = ComputeTotalBlocksForComponent(2);
+                progCoeffBuffers2 = new short[totalBlocks][];
+                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers2[i] = new short[64];
+            }
         }
 
         /// <summary>
@@ -468,9 +517,71 @@ namespace JpegBmpConverter
                         break;
 
                     case DecompressState.DSTATE_SCANNING:
-                        if (!ProcessScanlines())
-                            return false;
-                        cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                        // 支持多次SOS扫描：逐个扫描直至遇到EOI
+                        while (true)
+                        {
+                            if (!ProcessScanlines())
+                                return false;
+
+                            if (bitstreamEnded)
+                            {
+                                // 当前位置应指向一个标记字节0xFF
+                                if (dataIndex + 1 < jpegData.Length && jpegData[dataIndex] == 0xFF)
+                                {
+                                    int marker = jpegData[dataIndex + 1];
+                                    // 如果是EOI则消费并结束
+                                    if (marker == 0xD9)
+                                    {
+                                        // 消费EOI标记，推进指针
+                                        if (!ParseNextSegment())
+                                            return false;
+                                        cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                                        break;
+                                    }
+
+                                    // 否则继续解析后续段，直到找到下一个SOS
+                                    int prevScanStart = scanDataStart;
+                                    bool foundNextSOS = false;
+                                    while (dataIndex < jpegData.Length)
+                                    {
+                                        if (!ParseNextSegment())
+                                            return false;
+                                        if (scanDataStart != prevScanStart)
+                                        {
+                                            foundNextSOS = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (!foundNextSOS)
+                                    {
+                                        // 未找到下一个SOS，结束解码
+                                        cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                                        break;
+                                    }
+
+                                    // 重置位流状态并开始下一次扫描
+                                    bitstreamEnded = false;
+                                    cinfo.global_state = DecompressState.DSTATE_READY;
+                                    if (!JpegStartDecompress())
+                                        return false;
+                                    // 继续处理下一扫描
+                                    continue;
+                                }
+                                else
+                                {
+                                    // 无法读取到标记，结束
+                                    cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                // 常规路径：扫描完成后进入停止状态
+                                cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                                break;
+                            }
+                        }
                         break;
 
                     case DecompressState.DSTATE_STOPPING:
@@ -598,6 +709,10 @@ namespace JpegBmpConverter
                 bitBuffer = 0;
                 bitsInBuffer = 0;
                 dataIndex = scanDataStart;
+                bitstreamEnded = false; // 新扫描开始，位流可读
+
+                // Allocate progressive coefficient buffers if needed
+                AllocateProgressiveBuffersIfNeeded();
 
                 // 将扫描数据提供给霍夫曼解码器的数据源
                 cinfo.src.buffer = jpegData;
@@ -737,8 +852,17 @@ namespace JpegBmpConverter
                         var blocks = DecodeMCUBlocks(imcuRow, mcuCol);
                         if (blocks == null)
                         {
-                            SetError($"解码IMCU行 {imcuRow} 的MCU列 {mcuCol} 失败");
-                            return false;
+                            // If scan ends early (encountered next marker), treat this scan as complete
+                            if (bitstreamEnded)
+                            {
+                                Console.WriteLine($"Scan ended early at iMCU row {imcuRow}, MCU column {mcuCol}");
+                                return true;
+                            }
+                            else
+                            {
+                                SetError($"解码IMCU行 {imcuRow} 的MCU列 {mcuCol} 失败");
+                                return false;
+                            }
                         }
                         rowBlocks.Add(blocks);
                     }
@@ -926,12 +1050,55 @@ namespace JpegBmpConverter
         {
             try
             {
-                
-                // 解码DC系数
-                coeffs[0] = DecodeDCCoeff(componentIndex);
-                
-                // 解码AC系数
-                DecodeACCoeffs(coeffs, componentIndex);
+                if (!progressiveMode)
+                {
+                    // baseline: decode full block
+                    coeffs[0] = DecodeDCCoeff(componentIndex);
+                    DecodeACCoeffs(coeffs, componentIndex);
+                    return true;
+                }
+
+                var ext = componentInfoExt[componentIndex];
+                int Ss = ext?.Ss ?? 0;
+                int Se = ext?.Se ?? 63;
+                int Ah = ext?.Ah ?? 0;
+                int Al = ext?.Al ?? 0;
+
+                // Progressive: store/merge into component buffer, then copy out
+                var compBuf = GetProgressiveBufferForComponent(componentIndex);
+                if (compBuf == null)
+                {
+                    SetError($"Progressive buffer not allocated for component {componentIndex}");
+                    return false;
+                }
+                int index = progBlockCursor[componentIndex];
+                if (index < 0 || index >= compBuf.Length)
+                {
+                    SetError($"Progressive block index out of range for component {componentIndex}: {index}/{compBuf.Length}");
+                    return false;
+                }
+
+                // DC first scan (Ss==0, Ah==0)
+                if (Ss == 0 && Ah == 0)
+                {
+                    short dc = DecodeDCCoeff(componentIndex);
+                    compBuf[index][0] = (short)(dc << Al);
+                }
+                // AC first scan (Ss>=1, Ah==0)
+                else if (Ss >= 1 && Ah == 0)
+                {
+                    DecodeACBandProgressive(compBuf[index], componentIndex, Ss, Se, Al);
+                }
+                else
+                {
+                    // Successive approximation refinement not yet supported
+                    SetError($"Unsupported progressive refinement scan: Ss={Ss}, Se={Se}, Ah={Ah}, Al={Al}");
+                    return false;
+                }
+
+                // Copy the current merged coefficients to output buffer
+                Array.Copy(compBuf[index], coeffs, 64);
+                progBlockCursor[componentIndex]++;
                 
                 return true;
             }
@@ -939,6 +1106,62 @@ namespace JpegBmpConverter
             {
                 SetError($"解码DCT块失败: {ex.Message}");
                 return false;
+            }
+        }
+
+        private short[][] GetProgressiveBufferForComponent(int compIndex)
+        {
+            if (compIndex == 0) return progCoeffBuffers0;
+            if (compIndex == 1) return progCoeffBuffers1;
+            if (compIndex == 2) return progCoeffBuffers2;
+            return null;
+        }
+
+        private void DecodeACBandProgressive(short[] targetBlock, int componentIndex, int startS, int endS, int Al)
+        {
+            var htbl = acHuffmanTables[componentInfoExt[componentIndex].ac_tbl_no];
+            if (htbl == null)
+            {
+                throw new InvalidOperationException($"AC Huffman table {componentInfoExt[componentIndex].ac_tbl_no} not initialized");
+            }
+
+            int k = 0;
+            while (k < 63)
+            {
+                int rs = HuffmanDecode(htbl);
+                if (rs == 0)
+                {
+                    break; // EOB
+                }
+                int r = (rs >> 4) & 0x0F;
+                int s = rs & 0x0F;
+                if (s == 0)
+                {
+                    if (r == 15)
+                    {
+                        k += 16; // ZRL
+                        continue;
+                    }
+                    else
+                    {
+                        break; // tolerate and stop
+                    }
+                }
+                k += r;
+                if (k >= 63) break;
+                int spectralIndex = k + 1; // 1..63
+                int zig = ZigZagOrder[spectralIndex];
+                int coeffBits = GetBits(s);
+                if (coeffBits < (1 << (s - 1)))
+                {
+                    coeffBits = coeffBits - (1 << s) + 1;
+                }
+                short val = (short)(coeffBits << Al);
+                if (spectralIndex >= startS && spectralIndex <= endS)
+                {
+                    targetBlock[zig] = val;
+                }
+                k++;
             }
         }
         
@@ -1583,6 +1806,10 @@ namespace JpegBmpConverter
                 case 0xC0: // SOF0 - Baseline DCT
                 case 0xC1: // SOF1 - Extended sequential DCT
                 case 0xC2: // SOF2 - Progressive DCT
+                    if (marker == 0xC2)
+                    {
+                        progressiveMode = true; // enable progressive decoding mode
+                    }
                     return ParseSOF();
                     
                 case 0xDB: // DQT - Define Quantization Table
@@ -1596,7 +1823,11 @@ namespace JpegBmpConverter
                     
                 case 0xDD: // DRI - Define Restart Interval
                     return ParseDRI();
-                    
+                case 0xD9: // EOI - End of Image
+                    // 结束标记，无后续长度字段；已前移两个字节
+                    cinfo.unread_marker = 0xD9;
+                    return true;
+                
                 case 0xE0: // APP0
                 case 0xE1: // APP1
                 case 0xE2: // APP2
@@ -1807,7 +2038,7 @@ namespace JpegBmpConverter
             dataIndex += 2;
             
             int componentCount = jpegData[dataIndex++];
-            Console.WriteLine($"解析SOS段: 扫描组件数 = {componentCount}");
+            Console.WriteLine($"Parsing SOS: components = {componentCount}");
             
             // 解析扫描组件
             for (int i = 0; i < componentCount; i++)
@@ -1817,7 +2048,7 @@ namespace JpegBmpConverter
                     
                 int componentId = jpegData[dataIndex++];
                 int tableSelectors = jpegData[dataIndex++];
-                Console.WriteLine($"扫描组件 {i}: ID={componentId}, DC表={(tableSelectors >> 4) & 0x0F}, AC表={tableSelectors & 0x0F}");
+                Console.WriteLine($"Scan component {i}: ID={componentId}, DC table={(tableSelectors >> 4) & 0x0F}, AC table={tableSelectors & 0x0F}");
 
                 // 根据组件ID找到对应索引，仅对该组件设置表
                 bool found = false;
@@ -1828,14 +2059,14 @@ namespace JpegBmpConverter
                     {
                         ext.dc_tbl_no = (tableSelectors >> 4) & 0x0F;
                         ext.ac_tbl_no = tableSelectors & 0x0F;
-                        Console.WriteLine($"组件索引 {j}: 分配DC表 {ext.dc_tbl_no}, AC表 {ext.ac_tbl_no}");
+                        Console.WriteLine($"Component index {j}: assign DC table {ext.dc_tbl_no}, AC table {ext.ac_tbl_no}");
                         found = true;
                         break;
                     }
                 }
                 if (!found)
                 {
-                    Console.WriteLine($"警告: 未找到组件ID {componentId} 的匹配项");
+                    Console.WriteLine($"Warning: component ID {componentId} not found in frame components");
                 }
             }
 
@@ -1847,8 +2078,28 @@ namespace JpegBmpConverter
                 cinfo.blocks_in_MCU = componentCount;
             }
 
-            // 跳过谱选择参数
-            dataIndex += 3;
+            // Parse spectral selection and successive approximation: Ss, Se, Ah/Al
+            if (dataIndex + 2 >= jpegData.Length)
+                return false;
+            int Ss = jpegData[dataIndex++];
+            int Se = jpegData[dataIndex++];
+            int AhAl = jpegData[dataIndex++];
+            int Ah = (AhAl >> 4) & 0x0F;
+            int Al = AhAl & 0x0F;
+            Console.WriteLine($"SOS params: Ss={Ss}, Se={Se}, Ah={Ah}, Al={Al}");
+
+            // Store params per-scan in extended component info (same for all components in scan)
+            for (int j = 0; j < Components; j++)
+            {
+                var ext = componentInfoExt[j];
+                if (ext != null)
+                {
+                    ext.Ss = Ss;
+                    ext.Se = Se;
+                    ext.Ah = Ah;
+                    ext.Al = Al;
+                }
+            }
             
             // 保存扫描数据开始位置
             scanDataStart = dataIndex;
