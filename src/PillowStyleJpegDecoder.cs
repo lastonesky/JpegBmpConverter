@@ -8,7 +8,7 @@ namespace JpegBmpConverter
     /// 基于libjpeg-turbo源码实现的JPEG解码器 - Pillow风格接口
     /// 直接翻译libjpeg-turbo的C源码逻辑到C#，严格禁止任何自定义实现
     /// </summary>
-    public class PillowStyleJpegDecoder
+    public partial class PillowStyleJpegDecoder
     {
         // 解码器状态枚举 - 对应libjpeg-turbo中的DSTATE_*
         public enum DecompressState
@@ -246,32 +246,7 @@ namespace JpegBmpConverter
             return mcusPerRow * imcuRows * hCount * vCount;
         }
 
-        // 为渐进JPEG分配系数缓冲区
-        private void AllocateProgressiveBuffersIfNeeded()
-        {
-            if (!progressiveMode) return;
-            // 分配并重置游标
-            for (int i = 0; i < progBlockCursor.Length; i++) progBlockCursor[i] = 0;
-
-            if (Components >= 1 && progCoeffBuffers0 == null)
-            {
-                int totalBlocks = ComputeTotalBlocksForComponent(0);
-                progCoeffBuffers0 = new short[totalBlocks][];
-                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers0[i] = new short[64];
-            }
-            if (Components >= 2 && progCoeffBuffers1 == null)
-            {
-                int totalBlocks = ComputeTotalBlocksForComponent(1);
-                progCoeffBuffers1 = new short[totalBlocks][];
-                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers1[i] = new short[64];
-            }
-            if (Components >= 3 && progCoeffBuffers2 == null)
-            {
-                int totalBlocks = ComputeTotalBlocksForComponent(2);
-                progCoeffBuffers2 = new short[totalBlocks][];
-                for (int i = 0; i < totalBlocks; i++) progCoeffBuffers2[i] = new short[64];
-            }
-        }
+        
 
         /// <summary>
         /// 初始化解码器信息 - 对应libjpeg-turbo中的jpeg_create_decompress
@@ -1051,55 +1026,12 @@ namespace JpegBmpConverter
             {
                 if (!progressiveMode)
                 {
-                    // baseline: decode full block
-                    coeffs[0] = DecodeDCCoeff(componentIndex);
-                    DecodeACCoeffs(coeffs, componentIndex);
-                    return true;
+                    // 基线解码由独立方法承载
+                    return DecodeDCTBlockBaseline(coeffs, componentIndex);
                 }
 
-                var ext = componentInfoExt[componentIndex];
-                int Ss = ext?.Ss ?? 0;
-                int Se = ext?.Se ?? 63;
-                int Ah = ext?.Ah ?? 0;
-                int Al = ext?.Al ?? 0;
-
-                // Progressive: store/merge into component buffer, then copy out
-                var compBuf = GetProgressiveBufferForComponent(componentIndex);
-                if (compBuf == null)
-                {
-                    SetError($"Progressive buffer not allocated for component {componentIndex}");
-                    return false;
-                }
-                int index = progBlockCursor[componentIndex];
-                if (index < 0 || index >= compBuf.Length)
-                {
-                    SetError($"Progressive block index out of range for component {componentIndex}: {index}/{compBuf.Length}");
-                    return false;
-                }
-
-                // DC first scan (Ss==0, Ah==0)
-                if (Ss == 0 && Ah == 0)
-                {
-                    short dc = DecodeDCCoeff(componentIndex);
-                    compBuf[index][0] = (short)(dc << Al);
-                }
-                // AC first scan (Ss>=1, Ah==0)
-                else if (Ss >= 1 && Ah == 0)
-                {
-                    DecodeACBandProgressive(compBuf[index], componentIndex, Ss, Se, Al);
-                }
-                else
-                {
-                    // Successive approximation refinement not yet supported
-                    SetError($"Unsupported progressive refinement scan: Ss={Ss}, Se={Se}, Ah={Ah}, Al={Al}");
-                    return false;
-                }
-
-                // Copy the current merged coefficients to output buffer
-                Array.Copy(compBuf[index], coeffs, 64);
-                progBlockCursor[componentIndex]++;
-                
-                return true;
+                // 渐进式解码由独立方法承载
+                return DecodeDCTBlockProgressive(coeffs, componentIndex);
             }
             catch (Exception ex)
             {
@@ -1108,61 +1040,7 @@ namespace JpegBmpConverter
             }
         }
 
-        private short[][] GetProgressiveBufferForComponent(int compIndex)
-        {
-            if (compIndex == 0) return progCoeffBuffers0;
-            if (compIndex == 1) return progCoeffBuffers1;
-            if (compIndex == 2) return progCoeffBuffers2;
-            return null;
-        }
-
-        private void DecodeACBandProgressive(short[] targetBlock, int componentIndex, int startS, int endS, int Al)
-        {
-            var htbl = acHuffmanTables[componentInfoExt[componentIndex].ac_tbl_no];
-            if (htbl == null)
-            {
-                throw new InvalidOperationException($"AC Huffman table {componentInfoExt[componentIndex].ac_tbl_no} not initialized");
-            }
-
-            int k = 0;
-            while (k < 63)
-            {
-                int rs = HuffmanDecode(htbl);
-                if (rs == 0)
-                {
-                    break; // EOB
-                }
-                int r = (rs >> 4) & 0x0F;
-                int s = rs & 0x0F;
-                if (s == 0)
-                {
-                    if (r == 15)
-                    {
-                        k += 16; // ZRL
-                        continue;
-                    }
-                    else
-                    {
-                        break; // tolerate and stop
-                    }
-                }
-                k += r;
-                if (k >= 63) break;
-                int spectralIndex = k + 1; // 1..63
-                int zig = ZigZagOrder[spectralIndex];
-                int coeffBits = GetBits(s);
-                if (coeffBits < (1 << (s - 1)))
-                {
-                    coeffBits = coeffBits - (1 << s) + 1;
-                }
-                short val = (short)(coeffBits << Al);
-                if (spectralIndex >= startS && spectralIndex <= endS)
-                {
-                    targetBlock[zig] = val;
-                }
-                k++;
-            }
-        }
+        
         
         /// <summary>
         /// 执行IDCT变换
@@ -1638,33 +1516,13 @@ namespace JpegBmpConverter
             {
                 int bit = GetBits(1);
                 code = (code << 1) | bit;
-                // 显示第218-220次解码的详细信息，或者当读取到长度10或更多时
-                bool showDetails = (huffmanDecodeCount >= 218 && huffmanDecodeCount <= 220) || l >= 10;
-                
-                if (showDetails)
-                {
-                    Console.WriteLine($"长度{l}: 读取位={bit}, 当前code=0x{code:X}");
-                }
-                
                 if (htbl.maxcode[l] != -1)
                 {
-                    if (showDetails)
-                    {
-                        Console.WriteLine($"  检查范围: mincode=0x{htbl.mincode[l]:X}, maxcode=0x{htbl.maxcode[l]:X}");
-                    }
                     if (code >= htbl.mincode[l] && code <= htbl.maxcode[l])
                     {
                         int index = htbl.valptr[l] + code - htbl.mincode[l];
-                        if (showDetails)
-                        {
-                            Console.WriteLine($"  匹配! index={index}, valptr={htbl.valptr[l]}");
-                        }
                         if (index >= 0 && index < htbl.huffval.Length)
                         {
-                            if (showDetails)
-                            {
-                                Console.WriteLine($"  返回值: 0x{htbl.huffval[index]:X2}");
-                            }
                             return htbl.huffval[index];
                         }
                         else
