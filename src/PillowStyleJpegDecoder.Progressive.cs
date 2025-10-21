@@ -8,6 +8,8 @@ namespace JpegBmpConverter
     /// </summary>
     public partial class PillowStyleJpegDecoder
     {
+        // 渐进式 AC 细化扫描需要的 EOBRUN 状态（每次扫描重置）
+        private int eobRun;
         /// <summary>
         /// 为渐进JPEG分配并初始化系数缓冲区
         /// - 每个分量按块数量分配 64 系数的缓冲
@@ -16,6 +18,9 @@ namespace JpegBmpConverter
         private void AllocateProgressiveBuffersIfNeeded()
         {
             if (!progressiveMode) return;
+
+            // 细化扫描计数重置
+            eobRun = 0;
 
             // 重置游标
             for (int i = 0; i < progBlockCursor.Length; i++) progBlockCursor[i] = 0;
@@ -112,9 +117,165 @@ namespace JpegBmpConverter
         }
 
         /// <summary>
+        /// DC 细化扫描（Ss==0, Ah>0）：对已存在的 DC 系数按位细化
+        /// </summary>
+        private void RefineDCProgressive(short[] targetBlock, int Al)
+        {
+            int bit = GetBits(1);
+            if (bit != 0)
+            {
+                int delta = 1 << Al;
+                if (targetBlock[0] >= 0)
+                    targetBlock[0] = (short)(targetBlock[0] + delta);
+                else
+                    targetBlock[0] = (short)(targetBlock[0] - delta);
+            }
+        }
+
+        /// <summary>
+        /// AC 细化扫描（Ss>=1, Ah>0）：支持 EOBRUN 与 ZRL
+        /// - 对谱选择范围内的非零系数进行逐位细化
+        /// - 根据霍夫曼符号插入新出现的±(1<<Al)系数
+        /// - 处理 EOBRUN：对当前带的非零系数细化一次后退出
+        /// </summary>
+        private void RefineACBandProgressive(short[] targetBlock, int componentIndex, int startS, int endS, int Al)
+        {
+            var htbl = acHuffmanTables[componentInfoExt[componentIndex].ac_tbl_no];
+            if (htbl == null)
+            {
+                throw new InvalidOperationException($"AC Huffman table {componentInfoExt[componentIndex].ac_tbl_no} not initialized");
+            }
+
+            int p1 = 1 << Al;   // 正向细化步长
+            int m1 = -p1;       // 负向细化步长
+            int k = startS;
+
+            // 若存在未消耗的 EOBRUN，仅对当前带非零系数做一次细化即可
+            if (eobRun > 0)
+            {
+                for (int spectralIndex = startS; spectralIndex <= endS; spectralIndex++)
+                {
+                    int zig = ZigZagOrder[spectralIndex];
+                    if (targetBlock[zig] != 0)
+                    {
+                        int b = GetBits(1);
+                        if (b != 0)
+                        {
+                            targetBlock[zig] = (short)(targetBlock[zig] >= 0 ? targetBlock[zig] + p1 : targetBlock[zig] + m1);
+                        }
+                    }
+                }
+                eobRun--;
+                return;
+            }
+
+            while (k <= endS)
+            {
+                int rs = HuffmanDecode(htbl);
+                int rRun = (rs >> 4) & 0x0F;
+                int sSize = rs & 0x0F;
+
+                if (sSize == 0)
+                {
+                    if (rRun == 15)
+                    {
+                        // ZRL：跳过16个零，同时遇到非零系数则消费一个细化位
+                        int zeros = 16;
+                        while (zeros > 0 && k <= endS)
+                        {
+                            int zig = ZigZagOrder[k];
+                            if (targetBlock[zig] != 0)
+                            {
+                                int b = GetBits(1);
+                                if (b != 0)
+                                {
+                                    targetBlock[zig] = (short)(targetBlock[zig] >= 0 ? targetBlock[zig] + p1 : targetBlock[zig] + m1);
+                                }
+                            }
+                            else
+                            {
+                                zeros--;
+                            }
+                            k++;
+                        }
+                    }
+                    else
+                    {
+                        // EOBRUN：读取 rRun 个附加位，形成 EOBRUN = (1<<rRun) + bits - 1
+                        int add = rRun > 0 ? GetBits(rRun) : 0;
+                        eobRun = (1 << rRun) + add - 1;
+                        // 对当前带剩余非零系数做一次细化后退出
+                        for (int spectralIndex = k; spectralIndex <= endS; spectralIndex++)
+                        {
+                            int zig = ZigZagOrder[spectralIndex];
+                            if (targetBlock[zig] != 0)
+                            {
+                                int b = GetBits(1);
+                                if (b != 0)
+                                {
+                                    targetBlock[zig] = (short)(targetBlock[zig] >= 0 ? targetBlock[zig] + p1 : targetBlock[zig] + m1);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+                else if (sSize == 1)
+                {
+                    // 先跳过 rRun 个零位置；途中遇到非零系数则消费细化位
+                    while (rRun > 0 && k <= endS)
+                    {
+                        int zig = ZigZagOrder[k];
+                        if (targetBlock[zig] != 0)
+                        {
+                            int b = GetBits(1);
+                            if (b != 0)
+                            {
+                                targetBlock[zig] = (short)(targetBlock[zig] >= 0 ? targetBlock[zig] + p1 : targetBlock[zig] + m1);
+                            }
+                        }
+                        else
+                        {
+                            rRun--;
+                        }
+                        k++;
+                    }
+
+                    if (k > endS) break;
+
+                    // 在当前位置引入一个新的非零系数，符号由 1 位决定
+                    int zigNew = ZigZagOrder[k];
+                    int signBit = GetBits(1);
+                    targetBlock[zigNew] = (short)(signBit != 0 ? p1 : m1);
+                    k++;
+                }
+                else
+                {
+                    SetError($"Invalid AC refine symbol s={sSize}");
+                    return;
+                }
+            }
+
+            // 完成本带后，对剩余位置的非零系数各做一次细化（若仍未处理）
+            for (int spectralIndex = k; spectralIndex <= endS; spectralIndex++)
+            {
+                int zig = ZigZagOrder[spectralIndex];
+                if (targetBlock[zig] != 0)
+                {
+                    int b = GetBits(1);
+                    if (b != 0)
+                    {
+                        targetBlock[zig] = (short)(targetBlock[zig] >= 0 ? targetBlock[zig] + p1 : targetBlock[zig] + m1);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// 解码单个DCT块（渐进式JPEG）
         /// - DC 首扫：解码DC并左移 Al 写入缓冲
         /// - AC 首扫：按谱选择范围写入指定频带
+        /// - DC/AC 细化：依据 Ah>0 执行逐次逼近
         /// - 将当前合并后的系数复制到输出并推进块游标
         /// </summary>
         private bool DecodeDCTBlockProgressive(short[] coeffs, int componentIndex)
@@ -139,6 +300,13 @@ namespace JpegBmpConverter
                 return false;
             }
 
+            // 非参与扫描的组件：不消耗位流，直接回填已有系数
+            if (ext != null && !ext.InScan)
+            {
+                Array.Copy(compBuf[index], coeffs, 64);
+                return true; // 不推进游标
+            }
+
             // DC 首扫（Ss==0, Ah==0）
             if (Ss == 0 && Ah == 0)
             {
@@ -150,10 +318,19 @@ namespace JpegBmpConverter
             {
                 DecodeACBandProgressive(compBuf[index], componentIndex, Ss, Se, Al);
             }
+            // DC 细化（Ss==0, Ah>0）
+            else if (Ss == 0 && Ah > 0)
+            {
+                RefineDCProgressive(compBuf[index], Al);
+            }
+            // AC 细化（Ss>=1, Ah>0）
+            else if (Ss >= 1 && Ah > 0)
+            {
+                RefineACBandProgressive(compBuf[index], componentIndex, Ss, Se, Al);
+            }
             else
             {
-                // 逐次逼近（Ah>0）暂不支持
-                SetError($"Unsupported progressive refinement scan: Ss={Ss}, Se={Se}, Ah={Ah}, Al={Al}");
+                SetError($"Unsupported progressive scan: Ss={Ss}, Se={Se}, Ah={Ah}, Al={Al}");
                 return false;
             }
 

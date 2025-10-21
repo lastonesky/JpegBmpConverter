@@ -201,6 +201,7 @@ namespace JpegBmpConverter
             public int Se; // Spectral selection end
             public int Ah; // Successive approximation high
             public int Al; // Successive approximation low
+            public bool InScan; // whether the component participates in current scan
         }
         
         private ComponentInfoExtended[] componentInfoExt = new ComponentInfoExtended[4];
@@ -636,7 +637,7 @@ namespace JpegBmpConverter
                 cinfo.output_height = Height;
                 cinfo.output_components = Components;
                 
-                Console.WriteLine($"JPEG头部解析完成: {Width}x{Height}, 组件数: {Components}");
+                Console.WriteLine($"JPEG header parsed: {Width}x{Height}, components: {Components}");
                 return true;
             }
             catch (Exception ex)
@@ -660,18 +661,24 @@ namespace JpegBmpConverter
                     throw new InvalidOperationException($"Bad state for jpeg_start_decompress: {cinfo.global_state}");
                 }
 
-                // 初始化图像数据缓冲区
+                // 初始化图像数据缓冲区（渐进式多扫描不重复分配，避免覆盖已生成的像素）
                 int channels = (Components == 1) ? 1 : 3;
-                ImageData = new byte[Height, Width * channels];
-                
-                // 初始化主缓冲区
-                cinfo.main.buffer = new byte[8][][];
-                for (int i = 0; i < 8; i++)
+                if (ImageData == null || ImageData.GetLength(0) != Height || ImageData.GetLength(1) != Width * channels)
                 {
-                    cinfo.main.buffer[i] = new byte[10][];
-                    for (int j = 0; j < 10; j++)
+                    ImageData = new byte[Height, Width * channels];
+                }
+                
+                // 初始化主缓冲区（仅首次分配）
+                if (cinfo.main.buffer == null)
+                {
+                    cinfo.main.buffer = new byte[8][][];
+                    for (int i = 0; i < 8; i++)
                     {
-                        cinfo.main.buffer[i][j] = new byte[Width * channels];
+                        cinfo.main.buffer[i] = new byte[10][];
+                        for (int j = 0; j < 10; j++)
+                        {
+                            cinfo.main.buffer[i][j] = new byte[Width * channels];
+                        }
                     }
                 }
                 cinfo.main.buffer_full = false;
@@ -715,7 +722,7 @@ namespace JpegBmpConverter
                             cinfo.coef.MCU_buffer[i][r] = new short[8];
                         }
                     }
-                    Console.WriteLine($"分配MCU缓冲区: {cinfo.blocks_in_MCU} 块");
+                    Console.WriteLine($"Allocated MCU buffer: {cinfo.blocks_in_MCU} blocks");
                 }
 
                 // 构建并注入派生霍夫曼表给真实解码器
@@ -754,13 +761,13 @@ namespace JpegBmpConverter
                 // 初始化restart相关变量
                 cinfo.restarts_to_go = cinfo.restart_interval;
                 
-                Console.WriteLine($"扫描数据开始位置: {scanDataStart}, 数据长度: {jpegData.Length}");
+                Console.WriteLine($"Scan data start: {scanDataStart}, data length: {jpegData.Length}");
                 Console.WriteLine($"Restart interval: {cinfo.restart_interval}, restarts_to_go: {cinfo.restarts_to_go}");
                 
                 // 设置状态 - 对应源码最后几行
                 cinfo.global_state = cinfo.master.lossless ? DecompressState.DSTATE_RAW_OK : DecompressState.DSTATE_SCANNING;
 
-                Console.WriteLine("开始JPEG解压缩");
+                Console.WriteLine("Start JPEG decompression");
                 return true;
             }
             catch (Exception ex)
@@ -781,23 +788,32 @@ namespace JpegBmpConverter
                 {
                     var ext = componentInfoExt[ci];
                     if (ext == null) continue;
+                    if (progressiveMode && !ext.InScan) continue; // 渐进模式下仅配置参与扫描的组件
+
                     int dcNo = ext.dc_tbl_no;
                     int acNo = ext.ac_tbl_no;
                     var dcTbl = (dcNo >= 0 && dcNo < 4) ? cinfo.entropy.huffman_decoder.dc_derived_tbls[dcNo] : null;
                     var acTbl = (acNo >= 0 && acNo < 4) ? cinfo.entropy.huffman_decoder.ac_derived_tbls[acNo] : null;
                     if (dcTbl == null || acTbl == null)
                     {
-                        Console.WriteLine($"警告: 组件 {ci} 的霍夫曼表未完全定义 (DC={dcNo}, AC={acNo})");
+                        Console.WriteLine($"Warning: Huffman table for component {ci} is incomplete (DC={dcNo}, AC={acNo})");
                     }
-                    cinfo.entropy.huffman_decoder.dc_cur_tbls[configured] = dcTbl ?? cinfo.entropy.huffman_decoder.dc_derived_tbls[0];
-                    cinfo.entropy.huffman_decoder.ac_cur_tbls[configured] = acTbl ?? cinfo.entropy.huffman_decoder.ac_derived_tbls[0];
-                    configured++;
+
+                    int hCount = Math.Max(1, ext.hSampFactor);
+                    int vCount = Math.Max(1, ext.vSampFactor);
+                    int repeat = hCount * vCount;
+                    for (int r = 0; r < repeat && configured < blocks; r++)
+                    {
+                        cinfo.entropy.huffman_decoder.dc_cur_tbls[configured] = dcTbl ?? cinfo.entropy.huffman_decoder.dc_derived_tbls[0];
+                        cinfo.entropy.huffman_decoder.ac_cur_tbls[configured] = acTbl ?? cinfo.entropy.huffman_decoder.ac_derived_tbls[0];
+                        configured++;
+                    }
                 }
-                Console.WriteLine($"已配置 {configured} 个块的当前霍夫曼表");
+                Console.WriteLine($"Configured current Huffman table for {configured} blocks (blocks_in_MCU={blocks})");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"配置当前霍夫曼表失败: {ex.Message}");
+                Console.WriteLine($"Failed to configure current Huffman table: {ex.Message}");
             }
         }
 
@@ -889,7 +905,7 @@ namespace JpegBmpConverter
                     }
                 }
                 
-                Console.WriteLine($"成功读取 {Height} 条扫描线");
+                Console.WriteLine($"Successfully read {Height} scanlines");
                 return true;
             }
             catch (Exception ex)
@@ -964,6 +980,20 @@ namespace JpegBmpConverter
 
         private void ComposeMCUSegment(List<byte[][]> blocksPerComponent, int segmentWidth, int rowInIMCURow, byte[] ySeg, byte[] cbSeg, byte[] crSeg)
         {
+            // 根据SOF中的componentId确定Y/Cb/Cr的实际索引，避免非标准组件顺序导致颜色错位
+            int yIndex = -1, cbIndex = -1, crIndex = -1;
+            for (int i = 0; i < Components; i++)
+            {
+                int id = componentInfoExt[i]?.componentId ?? (i + 1);
+                if (id == 1 && yIndex < 0) yIndex = i; // Y
+                else if (id == 2 && cbIndex < 0) cbIndex = i; // Cb
+                else if (id == 3 && crIndex < 0) crIndex = i; // Cr
+            }
+            // 回退：若未识别到标准ID，则假设按顺序Y,Cb,Cr
+            if (yIndex < 0) yIndex = 0;
+            if (cbIndex < 0 && Components > 1) cbIndex = 1;
+            if (crIndex < 0 && Components > 2) crIndex = 2;
+
             for (int compIndex = 0; compIndex < Components; compIndex++)
             {
                 var component = componentInfoExt[compIndex];
@@ -998,15 +1028,15 @@ namespace JpegBmpConverter
                             {
                                 int x = dstBase + rep;
                                 if (x >= segmentWidth) break;
-                                if (Components == 1 || compIndex == 0)
+                                if (Components == 1 || compIndex == yIndex)
                                 {
                                     ySeg[x] = v;
                                 }
-                                else if (compIndex == 1)
+                                else if (compIndex == cbIndex)
                                 {
                                     cbSeg[x] = v;
                                 }
-                                else if (compIndex == 2)
+                                else if (compIndex == crIndex)
                                 {
                                     crSeg[x] = v;
                                 }
@@ -1365,7 +1395,7 @@ namespace JpegBmpConverter
                 // 设置最终状态 - 对应源码最后
                 cinfo.global_state = DecompressState.DSTATE_START;
                 
-                Console.WriteLine("JPEG解压缩完成");
+                Console.WriteLine("JPEG decompression completed");
                 return true;
             }
             catch (Exception ex)
@@ -1419,18 +1449,11 @@ namespace JpegBmpConverter
                     
                 int nextByte = jpegData[dataIndex++];
                 
-                if (dataIndex <= scanDataStart + 10) // 只显示前10个字节
-                {
-                    Console.WriteLine($"读取字节 {dataIndex-1}: 0x{nextByte:X2}");
-                }
-                
                 // 处理填充字节0xFF
                 if (nextByte == 0xFF)
                 {
-                    Console.WriteLine($"遇到0xFF字节在位置 {dataIndex-1}");
                     if (dataIndex >= jpegData.Length)
                     {
-                        Console.WriteLine("数据结束，标记位流结束");
                         bitstreamEnded = true;
                         // 用0填充剩余位以完成当前读取
                         int remainingBits = nbits - bitsInBuffer;
@@ -1443,16 +1466,14 @@ namespace JpegBmpConverter
                     }
                         
                     int stuffByte = jpegData[dataIndex++];
-                    Console.WriteLine($"下一个字节: 0x{stuffByte:X2}");
+                    
                     if (stuffByte == 0x00)
                     {
-                        Console.WriteLine("0xFF00序列，表示真正的0xFF数据字节");
                         // 0xFF00序列，表示真正的0xFF数据字节
                         nextByte = 0xFF;
                     }
                     else
                     {
-                        Console.WriteLine($"遇到JPEG标记 0xFF{stuffByte:X2}，记录为未读标记并停止位读取");
                         // 记录未读标记，回退指针以便后续消费
                         cinfo.unread_marker = stuffByte;
                         dataIndex -= 2;
@@ -1509,7 +1530,7 @@ namespace JpegBmpConverter
             
             if (huffmanDecodeCount >= 218 && huffmanDecodeCount <= 220)  // 显示第218-220次解码
             {
-                Console.WriteLine($"=== 开始Huffman解码 #{huffmanDecodeCount} ({tableType}) ===");
+                Console.WriteLine($"=== Start Huffman decoding #{huffmanDecodeCount} ({tableType}) ===");
             }
             
             for (int l = 1; l <= 16; l++)
@@ -1527,14 +1548,14 @@ namespace JpegBmpConverter
                         }
                         else
                         {
-                            Console.WriteLine($"Huffman解码索引越界: l={l}, code={code:X}, index={index}, huffval.Length={htbl.huffval.Length}");
+                            Console.WriteLine($"Huffman decoding index out of range: l={l}, code={code:X}, index={index}, huffval.Length={htbl.huffval.Length}");
                         }
                     }
                 }
             }
             
             // 容错：未匹配到有效码字或位流已结束时返回0（EOB）
-            Console.WriteLine($"Huffman解码失败: 最终code={code:X}, 返回0作为EOB/零大小");
+            Console.WriteLine($"Huffman decoding failed: final code={code:X}, return 0 as EOB/zero size");
             return 0;
         }
         
@@ -1799,7 +1820,7 @@ namespace JpegBmpConverter
             dataIndex += 2;
             int endIndex = dataIndex + length - 2;
             
-            Console.WriteLine($"解析DHT段，长度: {length}");
+            Console.WriteLine($"Parsing DHT segment, length: {length}");
             
             while (dataIndex < endIndex)
             {
@@ -1844,12 +1865,12 @@ namespace JpegBmpConverter
                 if (tableClass == 0)
                 {
                     dcHuffmanTables[tableId] = huffTable;
-                    Console.WriteLine($"存储DC Huffman表 {tableId}");
+                    Console.WriteLine($"Store DC Huffman table {tableId}");
                 }
                 else
                 {
                     acHuffmanTables[tableId] = huffTable;
-                    Console.WriteLine($"存储AC Huffman表 {tableId}");
+                    Console.WriteLine($"Store AC Huffman table {tableId}");
                 }
             }
             
@@ -1870,7 +1891,7 @@ namespace JpegBmpConverter
             // DRI段的长度应该是4（2字节长度 + 2字节restart interval）
             if (length != 4)
             {
-                Console.WriteLine($"警告: DRI段长度异常: {length}，期望4");
+                Console.WriteLine($"Warning: Abnormal DRI segment length: {length}, expected 4");
                 return SkipSegment();
             }
             
@@ -1878,7 +1899,7 @@ namespace JpegBmpConverter
             cinfo.restart_interval = (jpegData[dataIndex] << 8) | jpegData[dataIndex + 1];
             dataIndex += 2;
             
-            Console.WriteLine($"解析DRI段: restart_interval = {cinfo.restart_interval}");
+            Console.WriteLine($"Parsing DRI segment: restart_interval = {cinfo.restart_interval}");
             
             return true;
         }
@@ -1897,6 +1918,13 @@ namespace JpegBmpConverter
             int componentCount = jpegData[dataIndex++];
             Console.WriteLine($"Parsing SOS: components = {componentCount}");
             
+            // Reset in-scan flags for all components
+            for (int j = 0; j < Components; j++)
+            {
+                var extReset = componentInfoExt[j];
+                if (extReset != null) extReset.InScan = false;
+            }
+
             // 解析扫描组件
             for (int i = 0; i < componentCount; i++)
             {
@@ -1916,6 +1944,7 @@ namespace JpegBmpConverter
                     {
                         ext.dc_tbl_no = (tableSelectors >> 4) & 0x0F;
                         ext.ac_tbl_no = tableSelectors & 0x0F;
+                        ext.InScan = true; // mark this component participates in current scan
                         Console.WriteLine($"Component index {j}: assign DC table {ext.dc_tbl_no}, AC table {ext.ac_tbl_no}");
                         found = true;
                         break;
@@ -1929,11 +1958,24 @@ namespace JpegBmpConverter
 
             // 更新当前扫描组件数量
             cinfo.comps_in_scan = componentCount;
-            if (cinfo.blocks_in_MCU <= 0)
+            
+            // 使用参与扫描的组件与采样因子准确计算 blocks_in_MCU
+            int blocksInMCU = 0;
+            for (int j = 0; j < Components; j++)
             {
-                // 简化为每组件一个块，后续可按采样因子计算
-                cinfo.blocks_in_MCU = componentCount;
+                var ext = componentInfoExt[j];
+                if (ext == null) continue;
+                if (progressiveMode && !ext.InScan) continue; // 在渐进扫描中只统计参与组件
+                int hCount = Math.Max(1, ext.hSampFactor);
+                int vCount = Math.Max(1, ext.vSampFactor);
+                blocksInMCU += hCount * vCount;
             }
+            if (blocksInMCU <= 0)
+            {
+                // 兜底：至少一个块
+                blocksInMCU = Math.Max(1, componentCount);
+            }
+            cinfo.blocks_in_MCU = blocksInMCU;
 
             // Parse spectral selection and successive approximation: Ss, Se, Ah/Al
             if (dataIndex + 2 >= jpegData.Length)
@@ -2038,7 +2080,7 @@ namespace JpegBmpConverter
         {
             try
             {
-                Console.WriteLine("检测到需要处理restart marker");
+                Console.WriteLine("Detected need to handle restart marker");
                 
                 // 对齐到字节边界
                 bitBuffer = 0;
@@ -2053,7 +2095,7 @@ namespace JpegBmpConverter
                         int marker = jpegData[dataIndex + 1];
                         if (marker >= 0xD0 && marker <= 0xD7)
                         {
-                            Console.WriteLine($"找到restart marker: 0xFF{marker:X2}");
+                            Console.WriteLine($"Found restart marker: 0xFF{marker:X2}");
                             dataIndex += 2;
                             
                             // 重置restart计数器
@@ -2070,14 +2112,14 @@ namespace JpegBmpConverter
                         else if (marker != 0x00)
                         {
                             // 遇到其他marker，可能是数据结束
-                            Console.WriteLine($"遇到非restart marker: 0xFF{marker:X2}");
+                            Console.WriteLine($"Encountered non-restart marker: 0xFF{marker:X2}");
                             return false;
                         }
                     }
                     dataIndex++;
                 }
                 
-                Console.WriteLine("未找到restart marker");
+                Console.WriteLine("No restart marker found");
                 return false;
             }
             catch (Exception ex)
@@ -2090,7 +2132,7 @@ namespace JpegBmpConverter
         private void SetError(string message)
         {
             ErrorMessage = message;
-            Console.WriteLine($"错误: {message}");
+            Console.WriteLine($"Error: {message}");
         }
     }
 }
