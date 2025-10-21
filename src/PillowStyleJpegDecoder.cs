@@ -185,7 +185,9 @@ namespace JpegBmpConverter
         private short[][] progCoeffBuffers0;   // 分量0（通常Y）的系数缓冲（每块64系数）
         private short[][] progCoeffBuffers1;   // 分量1（通常Cb）的系数缓冲
         private short[][] progCoeffBuffers2;   // 分量2（通常Cr）的系数缓冲
-        private int[] progBlockCursor = new int[4]; // 渐进扫描时每分量的块游标
+        private int[] progBlockCursor = new int[4]; // 显示/合成时每分量的块游标
+        private int[] progDecodeCursor = new int[4]; // 渐进扫描时参与组件的解码游标
+        private int[] progDisplayCursor = new int[4]; // 扫描内用于合成输出的游标
         
         // 组件信息扩展
         public class ComponentInfoExtended
@@ -552,9 +554,44 @@ namespace JpegBmpConverter
                             }
                             else
                             {
-                                // 常规路径：扫描完成后进入停止状态
-                                cinfo.global_state = DecompressState.DSTATE_STOPPING;
-                                break;
+                                // 位流未结束：在完成一次扫描线输出后，尝试直接进入下一扫描
+                                int prevScanStart = scanDataStart;
+                                bool foundNextSOS = false;
+
+                                // 对齐位流状态，避免残留位影响后续段解析
+                                bitBuffer = 0;
+                                bitsInBuffer = 0;
+
+                                while (dataIndex < jpegData.Length)
+                                {
+                                    if (!ParseNextSegment())
+                                        return false;
+                                    // 如果扫描数据起点发生变化，说明找到新的SOS
+                                    if (scanDataStart != prevScanStart)
+                                    {
+                                        foundNextSOS = true;
+                                        break;
+                                    }
+                                    // 如果遇到EOI，停止寻找
+                                    if (cinfo.unread_marker == 0xD9)
+                                    {
+                                        foundNextSOS = false;
+                                        break;
+                                    }
+                                }
+
+                                if (foundNextSOS)
+                                {
+                                    cinfo.global_state = DecompressState.DSTATE_READY;
+                                    if (!JpegStartDecompress())
+                                        return false;
+                                    continue; // 进入下一扫描
+                                }
+                                else
+                                {
+                                    cinfo.global_state = DecompressState.DSTATE_STOPPING;
+                                    break;
+                                }
                             }
                         }
                         break;
@@ -2002,6 +2039,18 @@ namespace JpegBmpConverter
             
             // 保存扫描数据开始位置
             scanDataStart = dataIndex;
+
+            // 在进入每个新扫描时，重置渐进式状态以确保游标从0开始
+            if (progressiveMode)
+            {
+                eobRun = 0;
+                for (int i = 0; i < progBlockCursor.Length; i++)
+                {
+                    progBlockCursor[i] = 0;      // 兼容旧路径
+                    progDecodeCursor[i] = 0;     // 解码游标
+                    progDisplayCursor[i] = 0;    // 合成游标
+                }
+            }
             
             return true;
         }

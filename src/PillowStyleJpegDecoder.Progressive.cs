@@ -22,8 +22,13 @@ namespace JpegBmpConverter
             // 细化扫描计数重置
             eobRun = 0;
 
-            // 重置游标
-            for (int i = 0; i < progBlockCursor.Length; i++) progBlockCursor[i] = 0;
+            // 重置游标（解码与显示）
+            for (int i = 0; i < progBlockCursor.Length; i++)
+            {
+                progBlockCursor[i] = 0;
+                progDecodeCursor[i] = 0;
+                progDisplayCursor[i] = 0;
+            }
 
             // 分量0（通常为Y）
             if (Components >= 1 && progCoeffBuffers0 == null)
@@ -293,18 +298,25 @@ namespace JpegBmpConverter
                 return false;
             }
 
-            int index = progBlockCursor[componentIndex];
+            // 非参与扫描的组件：不消耗位流，仅用于合成输出的游标推进
+            if (ext != null && !ext.InScan)
+            {
+                int didx = progDisplayCursor[componentIndex];
+                if (didx < 0 || didx >= compBuf.Length)
+                {
+                    // 合成游标超出则回绕到起始，避免显示越界
+                    didx = 0;
+                }
+                Array.Copy(compBuf[didx], coeffs, 64);
+                progDisplayCursor[componentIndex]++;
+                return true;
+            }
+
+            int index = progDecodeCursor[componentIndex];
             if (index < 0 || index >= compBuf.Length)
             {
                 SetError($"Progressive block index out of range for component {componentIndex}: {index}/{compBuf.Length}");
                 return false;
-            }
-
-            // 非参与扫描的组件：不消耗位流，直接回填已有系数
-            if (ext != null && !ext.InScan)
-            {
-                Array.Copy(compBuf[index], coeffs, 64);
-                return true; // 不推进游标
             }
 
             // DC 首扫（Ss==0, Ah==0）
@@ -334,9 +346,9 @@ namespace JpegBmpConverter
                 return false;
             }
 
-            // 将当前块的合并系数复制到输出缓冲并推进游标
+            // 将当前块的合并系数复制到输出缓冲并推进解码游标
             Array.Copy(compBuf[index], coeffs, 64);
-            progBlockCursor[componentIndex]++;
+            progDecodeCursor[componentIndex]++;
             return true;
         }
     }
